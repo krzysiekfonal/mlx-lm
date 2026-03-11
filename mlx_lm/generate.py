@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import builtins as _builtins
 import contextlib
 import functools
 import json
@@ -37,6 +38,9 @@ from .models.cache import (
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
+
+if not hasattr(_builtins, "profile"):
+    profile = lambda f: f  # noqa: E731
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -300,6 +304,7 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
+@profile
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -389,6 +394,7 @@ def generate_step(
         else:
             return model(input_tokens, cache=prompt_cache)
 
+    @profile
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
 
@@ -466,6 +472,7 @@ def generate_step(
         n += 1
 
 
+@profile
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -549,6 +556,7 @@ def speculative_generate_step(
         y = sampler(logprobs)
         return y, logprobs
 
+    @profile
     def _step(model, cache, y, n_predict=1, apply_logits_processors=True):
         with mx.stream(generation_stream):
             logits = model(y[None], cache=cache)
@@ -575,6 +583,7 @@ def speculative_generate_step(
             else:
                 return _process_and_sample(None, logits.squeeze(0))
 
+    @profile
     def _prefill(model, cache, y):
         while y.size > prefill_step_size:
             model(y[:prefill_step_size][None], cache=cache)
@@ -584,10 +593,22 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
+    @profile
     def _rewind_cache(num_draft, num_accept):
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
+    @profile
+    def _translate_to_verifier(draft_token_list):
+        text = draft_tokenizer.decode(draft_token_list)
+        return text, tokenizer.encode(text, add_special_tokens=False)
+
+    @profile
+    def _translate_to_draft(verifier_token_ids):
+        text = tokenizer.decode(verifier_token_ids)
+        return text, draft_tokenizer.encode(text, add_special_tokens=False)
+
+    @profile
     def _draft_generate(y, num_draft):
         if num_draft == 0:
             return mx.array([], mx.uint32)
@@ -628,10 +649,7 @@ def speculative_generate_step(
                 draft_token_list = draft_tokens.tolist()
 
                 # Decode draft tokens to text, re-encode with verifier tokenizer
-                draft_text = draft_tokenizer.decode(draft_token_list)
-                verifier_token_ids = tokenizer.encode(
-                    draft_text, add_special_tokens=False
-                )
+                draft_text, verifier_token_ids = _translate_to_verifier(draft_token_list)
                 n_verifier = len(verifier_token_ids)
 
                 if n_verifier == 0:
@@ -643,10 +661,7 @@ def speculative_generate_step(
                     if ntoks == max_tokens:
                         break
                     y = mx.array([tokens_v.item()], mx.uint32)
-                    corr_text = tokenizer.decode([tokens_v.item()])
-                    draft_corr = draft_tokenizer.encode(
-                        corr_text, add_special_tokens=False
-                    )
+                    _, draft_corr = _translate_to_draft([tokens_v.item()])
                     cache.trim_prompt_cache(draft_cache, num_draft - 1)
                     num_draft = 0
                     if draft_corr:
@@ -716,13 +731,8 @@ def speculative_generate_step(
 
                 # Translate accepted + correction text back to draft tokens
                 # and feed them to the draft model so it stays in sync
-                all_new_verifier = (
-                    verifier_token_ids[:n_accept_v] + [correction_token]
-                )
-                new_text = tokenizer.decode(all_new_verifier)
-                new_draft_tokens = draft_tokenizer.encode(
-                    new_text, add_special_tokens=False
-                )
+                all_new_verifier = verifier_token_ids[:n_accept_v] + [correction_token]
+                _, new_draft_tokens = _translate_to_draft(all_new_verifier)
 
                 if new_draft_tokens:
                     if len(new_draft_tokens) > 1:
