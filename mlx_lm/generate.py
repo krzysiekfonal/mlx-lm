@@ -5,6 +5,7 @@ import builtins as _builtins
 import contextlib
 import functools
 import json
+import logging
 import sys
 import time
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ from .utils import does_model_support_input_embeddings, load
 
 if not hasattr(_builtins, "profile"):
     profile = lambda f: f  # noqa: E731
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -622,6 +625,17 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
+    def _dec(ids, tok=None):
+        """Decode token id(s) to a repr string for debug logging."""
+        t = tok or tokenizer
+        if t is None:
+            return str(ids)
+        try:
+            seq = [ids] if isinstance(ids, int) else list(ids)
+            return repr(t.decode(seq))
+        except Exception:
+            return "<?>"
+
     if cross_tokenizer:
         # Re-encode prompt for the draft model's tokenizer
         prompt_text = tokenizer.decode(prompt.tolist())
@@ -652,10 +666,29 @@ def speculative_generate_step(
                 draft_text, verifier_token_ids = _translate_to_verifier(draft_token_list)
                 n_verifier = len(verifier_token_ids)
 
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[speculative][cross] draft:    ids=%s  text=%s",
+                        draft_token_list, repr(draft_text),
+                    )
+                    logger.debug(
+                        "[speculative][cross] forward translation -> verifier ids=%s  text=%s",
+                        verifier_token_ids,
+                        _dec(verifier_token_ids),
+                    )
+
                 if n_verifier == 0:
                     # Draft text produced no verifier tokens; do a plain verifier step
+                    logger.debug(
+                        "[speculative][cross] n_verifier=0: draft text maps to no verifier tokens, "
+                        "running plain verifier step"
+                    )
                     tokens_v, logprobs_v = _step(model, model_cache, y, 1)
                     mx.eval(tokens_v)
+                    logger.debug(
+                        "[speculative][cross] fallback verifier token: id=%d  text=%s",
+                        tokens_v.item(), _dec(tokens_v.item()),
+                    )
                     ntoks += 1
                     yield tokens_v.item(), logprobs_v.squeeze(0), False
                     if ntoks == max_tokens:
@@ -696,13 +729,35 @@ def speculative_generate_step(
                 mx.eval(tokens_v)
                 tokens_list = tokens_v.tolist()
 
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[speculative][cross] verifier sampled: ids=%s  text=%s",
+                        tokens_list, _dec(tokens_list),
+                    )
+
                 # Find first disagreement between verifier samples and
                 # the re-encoded draft tokens
                 n_accept_v = 0
                 while n_accept_v < n_verifier:
-                    if tokens_list[n_accept_v] != verifier_token_ids[n_accept_v]:
+                    proposed = verifier_token_ids[n_accept_v]
+                    sampled = tokens_list[n_accept_v]
+                    if proposed != sampled:
+                        logger.debug(
+                            "[speculative][cross] compare[%d]: proposed=%d %s  sampled=%d %s  -> MISMATCH",
+                            n_accept_v, proposed, _dec(proposed), sampled, _dec(sampled),
+                        )
                         break
+                    logger.debug(
+                        "[speculative][cross] compare[%d]: proposed=%d %s  sampled=%d %s  -> MATCH",
+                        n_accept_v, proposed, _dec(proposed), sampled, _dec(sampled),
+                    )
                     n_accept_v += 1
+
+                correction = tokens_list[n_accept_v]
+                logger.debug(
+                    "[speculative][cross] result: accepted %d/%d | correction id=%d  text=%s",
+                    n_accept_v, n_verifier, correction, _dec(correction),
+                )
 
                 # Yield accepted verifier tokens
                 for i in range(n_accept_v):
@@ -785,16 +840,40 @@ def speculative_generate_step(
                 mx.eval(tokens, draft_tokens)
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[speculative] draft:    ids=%s  text=%s",
+                        draft_tokens, _dec(draft_tokens),
+                    )
+                    logger.debug(
+                        "[speculative] verifier: ids=%s  text=%s",
+                        tokens, _dec(tokens),
+                    )
+
                 n = 0
                 while n < num_draft:
                     tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
                     if tn != dtn:
+                        logger.debug(
+                            "[speculative] compare[%d]: draft=%d %s  verifier=%d %s  -> MISMATCH",
+                            n, dtn, _dec(dtn), tn, _dec(tn),
+                        )
                         break
+                    logger.debug(
+                        "[speculative] compare[%d]: draft=%d %s  verifier=%d %s  -> MATCH",
+                        n, dtn, _dec(dtn), tn, _dec(tn),
+                    )
                     n += 1
                     ntoks += 1
                     yield tn, lpn, True
                     if ntoks == max_tokens:
                         break
+
+                logger.debug(
+                    "[speculative] result: accepted %d/%d | correction id=%d  text=%s",
+                    n, num_draft, tokens[n], _dec(tokens[n]),
+                )
                 if ntoks < max_tokens:
                     ntoks += 1
                     yield tokens[n], logprobs[n], False
